@@ -1,7 +1,7 @@
 # Script to enumerate Atomic tests and save to CSV
 
 # Invoke AtomicTest to get all tests
-$atomicTestsOutput = Invoke-Expression "Invoke-AtomicTest ALL -ShowDetailsBrief"
+$atomicTestsOutput = Invoke-Expression "Invoke-AtomicTest ALL -ShowDetailsBrief"  *>&1 | Out-String
 
 # Extract tests and their names
 $tests = $atomicTestsOutput -split "`r`n" | Where-Object { $_ -match "T\d+.*" }
