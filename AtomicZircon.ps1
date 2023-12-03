@@ -1,5 +1,5 @@
 param (
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory=$false)]
     [string[]]$testIDs,
 
     [string]$ZircolitePath = "C:\users\domainuser\tools\Zircolite-master\Zircolite-master",
@@ -8,7 +8,9 @@ param (
 
     [switch]$ShowZircoliteOutput,
 
-    [int]$DelayInSeconds = 1
+    [int]$DelayInSeconds = 1,
+
+    [string]$testIdCsv  # New parameter for specifying the CSV file
 )
 
 # Improved Export-EventLogs function with added error handling and logging
@@ -29,6 +31,32 @@ function Export-EventLogs {
         Write-Error "Error exporting event logs: $_"
     }
 }
+
+function Export-SysmonLogs {
+    param (
+        [DateTime]$StartTime,
+        [DateTime]$EndTime
+    )
+    try {
+        $currentPath = Get-Location
+        $logPath = "$currentPath\SysmonLogs_$((Get-Date).ToString('yyyyMMddHHmmss')).evtx"
+
+        # Format start and end times for the query
+        $startTimeString = $StartTime.ToUniversalTime().ToString("o")
+        $endTimeString = $EndTime.ToUniversalTime().ToString("o")
+
+        # Constructing the query
+        $query = "*[System[TimeCreated[@SystemTime >= '$startTimeString' and @SystemTime <= '$endTimeString']]]"
+
+        # Export Sysmon logs
+        wevtutil epl "Microsoft-Windows-Sysmon/Operational" $logPath /q:"$query"
+
+        return $logPath
+    } catch {
+        Write-Error "Error exporting Sysmon logs: $_"
+    }
+}
+
 
 # Run-Zircolite function with better error handling and logging
 function Run-Zircolite {
@@ -89,6 +117,10 @@ function RunAtomicTest {
         } else {
             Invoke-Expression "Invoke-AtomicTest $testID"
         }
+
+        Write-Host "Cleanup for $testID"
+        Invoke-Expression "Invoke-AtomicTest $testID -Cleanup" 
+
         Start-Sleep -Seconds $DelayInSeconds
         $csvPath = Export-EventLogs -StartTime $startTime
         $zircoliteOutput = Run-Zircolite -CsvPath $csvPath -EnableDebug:$EnableDebug
@@ -138,6 +170,36 @@ function AppendToAtomicSigmaMap {
 }
 
 # Main execution loop with enhanced error handling
+foreach ($testID in $testIDs) {
+    try {
+        $zircoliteOutput = RunAtomicTest -testID $testID
+        AppendToAtomicSigmaMap -ZircoliteOutput $zircoliteOutput -TestID $testID
+    } catch {
+        Write-Error "Error in main execution loop for test ID ${testID}: $_"
+    }
+}
+
+
+# Function to read test IDs from CSV
+function Get-TestIdsFromCsv {
+    param ([string]$CsvPath)
+    $testIds = @()
+    if (Test-Path -Path $CsvPath) {
+        Import-Csv -Path $CsvPath | ForEach-Object {
+            $testIds += $_.ID
+        }
+    } else {
+        Write-Error "CSV file not found at path: $CsvPath"
+    }
+    return $testIds
+}
+
+# Main execution loop with enhanced error handling
+if ($testIdCsv) {
+    # Get test IDs from CSV file
+    $testIDs = Get-TestIdsFromCsv -CsvPath $testIdCsv
+}
+
 foreach ($testID in $testIDs) {
     try {
         $zircoliteOutput = RunAtomicTest -testID $testID
