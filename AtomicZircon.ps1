@@ -36,6 +36,70 @@ function Export-EventLogs {
     }
 }
 
+function Export-RemoteEventLogs-Remote {
+    param (
+        [string]$RemoteComputerName,
+        [DateTime]$StartTime,
+        [DateTime]$EndTime,
+        [string]$LogName = 'Security',
+        [string]$DestinationPath,
+        [string]$LocalPath  # Local path to save the file
+    )
+
+    $scriptBlock = {
+        param($startTime, $endTime, $logName, $destinationPath)
+        $logFileName = "${logName}_$(Get-Date -Format 'yyyyMMddHHmmss').evtx"
+        $logPath = Join-Path -Path $destinationPath -ChildPath $logFileName
+        $query = "*[System[TimeCreated[@SystemTime >= '$startTime' and @SystemTime <= '$endTime']]]"
+        wevtutil epl $logName $logPath /q:"$query"
+        return $logPath
+    }
+
+    $remoteLogPath = Invoke-Command -ComputerName $RemoteComputerName -ScriptBlock $scriptBlock -ArgumentList $StartTime, $EndTime, $LogName, $DestinationPath
+    $localLogPath = Join-Path -Path $LocalPath -ChildPath (Split-Path -Leaf $remoteLogPath)
+
+    # Copy the file from the remote path to the local path
+    Copy-Item -Path $remoteLogPath -Destination $localLogPath -FromSession (New-PSSession -ComputerName $RemoteComputerName)
+}
+
+function Export-RemoteEventLogs {
+    param (
+        [string]$RemoteComputerName,
+        [DateTime]$StartTime,
+        [DateTime]$EndTime,
+        [string]$LogName = 'Security',
+        [string]$DestinationPath,
+        [string]$LocalPath  # Local path to save the file
+    )
+
+    $scriptBlock = {
+        param($startTime, $endTime, $logName, $destinationPath)
+        $logFileName = "${logName}_AD_$(Get-Date -Format 'yyyyMMddHHmmss').evtx"
+        $logPath = Join-Path -Path $destinationPath -ChildPath $logFileName
+        $query = "*[System[TimeCreated[@SystemTime >= '$startTime' and @SystemTime <= '$endTime']]]"
+        wevtutil epl $logName $logPath /q:"$query"
+        return $logPath
+    }
+
+    # Try to export the log and get its remote path
+    $remoteLogPath = Invoke-Command -ComputerName $RemoteComputerName -ScriptBlock $scriptBlock -ArgumentList $StartTime, $EndTime, $LogName, $DestinationPath -ErrorAction Stop
+
+    if ($remoteLogPath) {
+        $localLogPath = Join-Path -Path $LocalPath -ChildPath (Split-Path -Leaf $remoteLogPath)
+        # Copy the file from the remote path to the local path
+        $session = New-PSSession -ComputerName $RemoteComputerName
+        Copy-Item -Path $remoteLogPath -Destination $localLogPath -FromSession $session
+        Remove-PSSession $session
+    } else {
+        Write-Error "Failed to export log from remote computer."
+    }
+    return $localLogPath
+}
+
+
+
+
+
 
 function Export-SysmonLogs {
     param (
@@ -63,45 +127,53 @@ function Export-SysmonLogs {
     }
 }
 
-
-# Run-Zircolite function with better error handling and logging
 function Run-Zircolite {
     param (
         [string]$SecurityLogPath,
         [string]$SysmonLogPath,
+        [string]$SecurityRemoteLogPath,
         [switch]$EnableDebug
     )
     try {
-
+        # Define output paths for Zircolite scan results
         $zircoliteOutputSecurity = Join-Path -Path $processFolderPath -ChildPath "zircolite_scan_security.csv"
         $zircoliteOutputSysmon = Join-Path -Path $processFolderPath -ChildPath "zircolite_scan_sysmon.csv"
+        $zircoliteOutputSecurityRemote = Join-Path -Path $processFolderPath -ChildPath "zircolite_scan_security_remote.csv"
 
+        # Paths to Zircolite rules
         $rulesPathSecurity = Join-Path -Path $ZircolitePath -ChildPath "rules\rules_windows_generic.json"
         $rulesPathSysmon = Join-Path -Path $ZircolitePath -ChildPath "rules\rules_windows_sysmon.json"
 
+        # Zircolite script path
         $zircoliteScriptPath = Join-Path -Path $ZircolitePath -ChildPath "zircolite.py"
 
-        # Run Zircolite for Security Logs
-        if (Test-Path -Path $rulesPathSecurity) {
-            $startProcessArgsSecurity = "`"$zircoliteScriptPath`" --evtx `"$SecurityLogPath`" --csv --outfile `"$zircoliteOutputSecurity`" -r `"$rulesPathSecurity`""
-            Start-Process -FilePath "python" -ArgumentList $startProcessArgsSecurity -Wait -WorkingDirectory $ZircolitePath
-        } else {
-            Write-Error "Security rules file not found at path: $rulesPathSecurity"
+        # Function to run Zircolite for a given log file
+        function Process-LogFile {
+            param (
+                [string]$LogFilePath,
+                [string]$OutputPath,
+                [string]$RulesPath
+            )
+            if (Test-Path -Path $LogFilePath) {
+                $startProcessArgs = "`"$zircoliteScriptPath`" --evtx `"$LogFilePath`" --csv --outfile `"$OutputPath`" -r `"$RulesPath`""
+                Start-Process -FilePath "python" -ArgumentList $startProcessArgs -Wait -WorkingDirectory $ZircolitePath
+            } else {
+                Write-Warning "Log file not found or path is invalid: $LogFilePath"
+            }
         }
 
-        # Run Zircolite for Sysmon Logs
-        if (Test-Path -Path $rulesPathSysmon) {
-            $startProcessArgsSysmon = "`"$zircoliteScriptPath`" --evtx `"$SysmonLogPath`" --csv --outfile `"$zircoliteOutputSysmon`" -r `"$rulesPathSysmon`""
-            Start-Process -FilePath "python" -ArgumentList $startProcessArgsSysmon -Wait -WorkingDirectory $ZircolitePath
-        } else {
-            Write-Error "Sysmon rules file not found at path: $rulesPathSysmon"
-        }
+        # Process each log file with Zircolite, if the path is valid
+        if ($SecurityLogPath) { Process-LogFile -LogFilePath $SecurityLogPath -OutputPath $zircoliteOutputSecurity -RulesPath $rulesPathSecurity }
+        if ($SysmonLogPath) { Process-LogFile -LogFilePath $SysmonLogPath -OutputPath $zircoliteOutputSysmon -RulesPath $rulesPathSysmon }
+        if ($SecurityRemoteLogPath) { Process-LogFile -LogFilePath $SecurityRemoteLogPath -OutputPath $zircoliteOutputSecurityRemote -RulesPath $rulesPathSecurity }
 
-        return $zircoliteOutputSecurity, $zircoliteOutputSysmon
+        return $zircoliteOutputSecurity, $zircoliteOutputSysmon, $zircoliteOutputSecurityRemote
     } catch {
         Write-Error "Error running Zircolite: $_"
     }
 }
+
+
 
 
 # Record-TestResult function with improved output
@@ -123,7 +195,9 @@ function Move-EventLogs {
         if (-not (Test-Path $eventDataFolder)) {
             New-Item -ItemType Directory -Path $eventDataFolder
         }
+        Write-Host "Moving file $LogPath to .\eventdata"
         Move-Item -Path $LogPath -Destination $eventDataFolder
+        
     } catch {
         Write-Error "Error moving event logs: $_"
     }
@@ -150,16 +224,38 @@ function RunAtomicTest {
 
         # Export Security and Sysmon logs
         $endTime = Get-Date
+        Write-Host "Exporting EventLogs"
         $securityLogPath = Export-EventLogs -StartTime $startTime -EndTime $endTime
+        try {
+            # The code that attempts the remote connection
+            Write-Host "Exporting Remote EventLogs"
+            $securityRemoteLogPath = Export-RemoteEventLogs -RemoteComputerName "AD2019-2ND" -StartTime $startTime -EndTime $endTime -LogName "Security" -DestinationPath "C:\\Users\\Public" -LocalPath "C:\users\domainuser\programming\atomiczircon"
+        } catch {
+            # Custom error handling for remote connection issues
+            Write-Host "Failed to connect to remote server 'AD2019-2ND'."
+            Write-Host "Error: $_"
+            Write-Host "Please ensure the server is reachable and that your credentials are correct."
+            Write-Host "Check if Kerberos authentication and WinRM configurations are set up properly."
+            # You can choose to return or continue based on your requirements
+            
+        }
+        Write-Host "Exporting SysmonLogs"
         $sysmonLogPath = Export-SysmonLogs -StartTime $startTime -EndTime $endTime
         
 
         # Run Zircolite for both log types
-        $zircoliteOutputs = Run-Zircolite -SecurityLogPath $securityLogPath -SysmonLogPath $sysmonLogPath -EnableDebug:$EnableDebug
+        #$zircoliteOutputs = Run-Zircolite -SecurityLogPath $securityLogPath -SysmonLogPath $sysmonLogPath -EnableDebug:$EnableDebug
+        Write-Host "Running zircolite"
+        Write-Host "On files \n- $securityLogPath\n- $sysmonLogPath\n- $securityRemoteLogPath"
+        $zircoliteOutputs = Run-Zircolite -SecurityLogPath $securityLogPath -SysmonLogPath $sysmonLogPath -SecurityRemoteLogPath $securityRemoteLogPath -EnableDebug:$EnableDebug
 
         # Move logs and handle results
+        
         Move-EventLogs -LogPath $securityLogPath
         Move-EventLogs -LogPath $sysmonLogPath # Assuming you have a similar mechanism for Sysmon logs
+        if ($securityRemoteLogPath){
+            Move-EventLogs -LogPath $securityRemoteLogPath
+        }
 
         Record-TestResult -TestID $testID -Results $zircoliteOutputs
 
@@ -177,64 +273,79 @@ function RunAtomicTest {
 }
 
 
-# AppendToAtomicSigmaMap function with improved logging
 function AppendToAtomicSigmaMap {
     param (
         [string]$ZircoliteSecurityOutput,
         [string]$ZircoliteSysmonOutput,
+        [string]$ZircoliteSecurityRemoteOutput,
         [string]$TestID,
-        [string]$TestName,  # Add TestName parameter
+        [string]$TestName,
         [int]$ExitCode
     )
 
     $sigmaMapPath = Join-Path -Path $outputFolderPath -ChildPath "AtomicSigmaMap.csv"
-   
-    # Process each Zircolite output
-    foreach ($output in @{'Security'=$ZircoliteSecurityOutput; 'Sysmon'=$ZircoliteSysmonOutput}.GetEnumerator()) {
-        $zircoliteData = Import-Csv -Path $output.Value -ErrorAction SilentlyContinue -Delimiter ';'
-        $includeColumns = @('rule_title', 'rule_level', 'rule_count', 'row_id', 'CommandLine')
+    $includeColumns = @('rule_title', 'rule_level', 'rule_count', 'row_id', 'CommandLine')
 
+    # Define a helper function to process each output
+    function Process-ZircoliteOutput {
+        param (
+            [string]$OutputPath,
+            [string]$LogSource,
+            [string]$RemoteSource = $null  # Default to null
+        )
+
+        $zircoliteData = Import-Csv -Path $OutputPath -ErrorAction SilentlyContinue -Delimiter ';'
         if ($zircoliteData) {
-            $modifiedData = $zircoliteData | ForEach-Object {
+            $zircoliteData | ForEach-Object {
                 $properties = [ordered]@{
                     'TestID' = $TestID
-                    'TestName' = $TestName
-                    'LogSource' = $output.Key  # Add log source column
+                    'LogSource' = $LogSource
+                    'RemoteSource' = $RemoteSource
                     'ExitCode' = $ExitCode
+                    'TestName' = $TestName
                 }
                 foreach ($column in $_.PSObject.Properties) {
                     if ($includeColumns -contains $column.Name) {
                         $properties[$column.Name] = $column.Value
                     }
                 }
-
-                #write-host "Properties (with zircoliteData): $properties"
                 New-Object PSObject -Property $properties
             }
-
-
         }
-        else{
-            $properties = [ordered]@{
+        else {
+            $emptyProperties = [ordered]@{
                 'TestID' = $TestID
-                'TestName' = $TestName
-                'LogSource' = $output.Key
+                'LogSource' = $LogSource
+                'RemoteSource' = $RemoteSource
                 'ExitCode' = $ExitCode
+                'TestName' = $TestName
             }
             foreach ($column in $includeColumns) {
-                $properties[$column] = $null  # Add empty values for other columns
+                $emptyProperties[$column] = $null
             }
-            write-host "Properties(without zircolite data): $properties"
-            $modifiedData = New-Object PSObject -Property $properties
+            New-Object PSObject -Property $emptyProperties
         }
+    }
+
+    # Process each Zircolite output
+    $outputs = @(
+        @{ Path = $ZircoliteSecurityOutput; Source = 'SecurityEvents'; Remote = "LocalMachine" },
+        @{ Path = $ZircoliteSysmonOutput; Source = 'Sysmon'; Remote = "LocalMachine" },
+        @{ Path = $ZircoliteSecurityRemoteOutput; Source = 'SecurityEvents'; Remote = 'RemoteActiveDirectory' }
+    )
+
+    foreach ($output in $outputs) {
+        Write-Host "Processing $output.Path with source $output.Source"
+        $processedData = Process-ZircoliteOutput -OutputPath $output.Path -LogSource $output.Source -RemoteSource $output.Remote
         # Append or create CSV
         if (Test-Path -Path $sigmaMapPath) {
-            $modifiedData | Export-Csv -Path $sigmaMapPath -NoTypeInformation -Append
+            $processedData | Export-Csv -Path $sigmaMapPath -NoTypeInformation -Append
         } else {
-            $modifiedData | Export-Csv -Path $sigmaMapPath -NoTypeInformation
+            $processedData | Export-Csv -Path $sigmaMapPath -NoTypeInformation
         }
     }
 }
+
 
 # Function to read test IDs from CSV
 
@@ -253,6 +364,18 @@ function Get-TestIdsFromCsv {
     return $testTuples
 }
 
+function Remove-FileIfExists {
+    param (
+        [string]$FilePath
+    )
+
+    if (Test-Path $FilePath) {
+        Remove-Item $FilePath -Force
+        Write-Host "File removed: $FilePath"
+    } else {
+        Write-Host "File does not exist: $FilePath"
+    }
+}
 
 
 
@@ -271,6 +394,8 @@ if (-not (Test-Path -Path $outputFolderPath)) {
     New-Item -ItemType Directory -Path $outputFolderPath
 }
 
+#remove 
+Remove-FileIfExists("output\AtomicSigmaMap.csv")
 
 # Main execution loop with enhanced error handling
 if ($testIdCsv) {
@@ -291,7 +416,7 @@ foreach ($testTuple in $testTuples) {
         $exitCode = $results[0]
         $zircoliteOutputs = $results[1]
         
-        AppendToAtomicSigmaMap -ZircoliteSecurityOutput $zircoliteOutputs[0] -ZircoliteSysmonOutput $zircoliteOutputs[1] -TestID $testID -TestName $testName -ExitCode $exitCode
+        AppendToAtomicSigmaMap -ZircoliteSecurityOutput $zircoliteOutputs[0] -ZircoliteSysmonOutput $zircoliteOutputs[1] -ZircoliteSecurityRemoteOutput $zircoliteOutputs[2]  -TestID $testID -TestName $testName -ExitCode $exitCode
     } catch {
         Write-Error "Error in main execution loop for test ID ${testID}: $_"
     }
